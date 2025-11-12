@@ -72,6 +72,9 @@ def _eq(a: float, b: float, tol: float = TOL) -> bool:
 gcode_lines: List[str] = []
 last_snapshot: Optional[List[str]] = None
 
+# Edit mode: None means "adding new". Otherwise it's the index being edited.
+edit_index: Optional[int] = None
+
 def snapshot():
     global last_snapshot
     last_snapshot = list(gcode_lines)
@@ -85,6 +88,8 @@ def restore_snapshot():
     for ln in gcode_lines:
         lines_listbox.insert(tk.END, ln)
     redraw_plot()
+    # If we were in edit mode, try to keep it sane
+    exit_edit_mode()
 
 # --------------------------- core add/merge ---------------------------
 
@@ -116,31 +121,133 @@ def add_or_merge_line(xn: float, yn: float):
     gcode_lines.append(new_text)
     lines_listbox.insert(tk.END, new_text)
 
+# --------------------------- edit-mode helpers ---------------------------
+
+def set_entry_highlight(on: bool):
+    """Switch X/Y entries to a yellow background when editing, white otherwise."""
+    style_name = "Edit.TEntry"
+    if on:
+        # Configure a style with light-yellow fieldbackground
+        style.configure(style_name, fieldbackground="#fff8cc")
+        x_entry.configure(style=style_name)
+        y_entry.configure(style=style_name)
+    else:
+        # Reset to default style
+        x_entry.configure(style="")
+        y_entry.configure(style="")
+
+def load_values_from_line(line: str):
+    xy = parse_g1_xy(line)
+    if xy is None:
+        return
+    x_val, y_val = xy
+    # Set without reformatting to keep user's original formatting feel,
+    # but preview will show formatted.
+    x_var.set(fmt_number(str(x_val)))
+    y_var.set(fmt_number(str(y_val)))
+    x_entry.focus_set()
+    x_entry.icursor(tk.END)
+
+def enter_edit_mode(index: int):
+    """Activate edit mode for the given list index."""
+    global edit_index
+    if index < 0 or index >= len(gcode_lines):
+        return
+    edit_index = index
+    # Ensure selection reflects the edit_index
+    lines_listbox.selection_clear(0, tk.END)
+    lines_listbox.selection_set(index)
+    lines_listbox.see(index)
+    load_values_from_line(gcode_lines[index])
+    set_entry_highlight(True)
+
+def exit_edit_mode():
+    """Exit edit mode and return to 'add new' behavior."""
+    global edit_index
+    edit_index = None
+    set_entry_highlight(False)
+    # Keep user's current text so they can continue adding, but deselect list
+    lines_listbox.selection_clear(0, tk.END)
+
+def on_list_select(_evt=None):
+    """When user selects a row, enter edit mode for that row."""
+    sel = lines_listbox.curselection()
+    if not sel:
+        return
+    idx = int(sel[0])
+    enter_edit_mode(idx)
+
+def select_new_row_action():
+    """Manual button to exit edit mode and go back to adding new lines."""
+    exit_edit_mode()
+    # Optional: clear fields to encourage new entry
+    # x_var.set(""); y_var.set("")
+    x_entry.focus_set()
+
+def update_selected_line(index: int, xn: float, yn: float):
+    """Replace the line at index with new X/Y, preserving surrounding list."""
+    new_text = f"G1 X{fmt_number(str(xn))} Y{fmt_number(str(yn))}"
+    gcode_lines[index] = new_text
+    lines_listbox.delete(index)
+    lines_listbox.insert(index, new_text)
+
 # --------------------------- actions ---------------------------
 
 def update_preview(*_):
     gcode_preview.set(build_preview_line(x_var.get(), y_var.get()))
 
 def submit_line(event=None):
+    global edit_index
     x_txt = fmt_number(x_var.get()); y_txt = fmt_number(y_var.get())
     if not x_txt or not y_txt:
         messagebox.showwarning("Missing values", "Enter valid numeric values for both X and Y.")
         return
-    snapshot()
     xn, yn = float(x_txt), float(y_txt)
-    add_or_merge_line(xn, yn)
-    update_preview(); redraw_plot()
-    x_entry.focus_set(); x_entry.icursor(tk.END)
+
+    # ADD mode
+    if edit_index is None:
+        snapshot()
+        add_or_merge_line(xn, yn)
+        update_preview(); redraw_plot()
+        x_entry.focus_set(); x_entry.icursor(tk.END)
+        return
+
+    # EDIT mode
+    snapshot()
+    # Update current line
+    update_selected_line(edit_index, xn, yn)
+    redraw_plot()
+
+    # Move to next line (batch editing). If there is a next line, select it and load values.
+    next_idx = edit_index + 1
+    if next_idx < len(gcode_lines):
+        enter_edit_mode(next_idx)
+    else:
+        # At the end: exit edit mode and behave like "new row" mode
+        exit_edit_mode()
+        # Keep current values so user can quickly submit a new point or change them
+        x_entry.focus_set(); x_entry.icursor(tk.END)
+
+    update_preview()
 
 def undo_last():
     restore_snapshot()
 
 def remove_selected():
+    global edit_index
     sel = list(lines_listbox.curselection())
-    if not sel: return
+    if not sel:
+        return
     snapshot()
     for idx in reversed(sel):
         lines_listbox.delete(idx); del gcode_lines[idx]
+        # If removing edited line, exit edit mode
+        if edit_index is not None:
+            if idx == edit_index:
+                exit_edit_mode()
+            elif idx < edit_index:
+                # Shift edit index since list shrank above it
+                edit_index -= 1
     redraw_plot()
 
 def clear_all_lines():
@@ -148,6 +255,7 @@ def clear_all_lines():
     if not messagebox.askyesno("Clear all", "Remove all G-code lines?"): return
     snapshot()
     gcode_lines.clear(); lines_listbox.delete(0, tk.END); redraw_plot()
+    exit_edit_mode()
 
 def copy_current_preview():
     app.clipboard_clear(); app.clipboard_append(gcode_preview.get())
@@ -212,6 +320,7 @@ def load_gcode():
         add_or_merge_line(float(xn), float(yn))
 
     redraw_plot()
+    exit_edit_mode()
     messagebox.showinfo("Loaded", f"Imported {len(parsed)} lines (skipped {skipped}).")
 
 def loop_block():
@@ -323,6 +432,9 @@ def auto_scale():
 app = tk.Tk()
 app.title("G-Code Generator")
 
+# ttk style (for edit highlight)
+style = ttk.Style(app)
+
 # layout
 app.columnconfigure(0, weight=0)
 app.columnconfigure(1, weight=1)
@@ -332,7 +444,7 @@ left = ttk.Frame(app, padding=12)
 left.grid(row=0, column=0, sticky="nsw")
 right = ttk.Frame(app, padding=12)
 right.grid(row=0, column=1, sticky="nsew")
-right.rowconfigure(4, weight=1)
+right.rowconfigure(5, weight=1)
 right.columnconfigure(0, weight=1)
 
 # --- Left: inputs & controls ---
@@ -393,7 +505,12 @@ preview_lbl = ttk.Label(right, textvariable=gcode_preview, font=("Consolas", 14)
                         background="#111", foreground="#9fef00", padding=12)
 preview_lbl.grid(row=1, column=0, sticky="ew", pady=(8,12))
 
-ttk.Label(right, text="Submitted Lines (saved between M3 ... M5)", font=("Segoe UI", 11, "bold")).grid(row=2, column=0, sticky="w")
+# Header + Select New Row button row
+header_row = ttk.Frame(right)
+header_row.grid(row=2, column=0, sticky="ew")
+header_row.columnconfigure(0, weight=1)
+ttk.Label(header_row, text="Submitted Lines (saved between M3 ... M5)", font=("Segoe UI", 11, "bold")).grid(row=0, column=0, sticky="w")
+ttk.Button(header_row, text="Select New Row", command=select_new_row_action).grid(row=0, column=1, sticky="e")
 
 list_plot = ttk.Frame(right); list_plot.grid(row=3, column=0, sticky="nsew", pady=(6,0))
 list_plot.columnconfigure(0, weight=1); list_plot.columnconfigure(1, weight=1)
@@ -402,11 +519,12 @@ list_plot.rowconfigure(0, weight=1)
 # Listbox
 list_frame = ttk.Frame(list_plot); list_frame.grid(row=0, column=0, sticky="nsew", padx=(0,8))
 list_frame.rowconfigure(0, weight=1); list_frame.columnconfigure(0, weight=1)
-lines_listbox = tk.Listbox(list_frame, font=("Consolas", 12))
+lines_listbox = tk.Listbox(list_frame, font=("Consolas", 12), exportselection=False)  # keep selection consistent
 lines_listbox.grid(row=0, column=0, sticky="nsew")
 scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=lines_listbox.yview)
 scrollbar.grid(row=0, column=1, sticky="ns")
 lines_listbox.configure(yscrollcommand=scrollbar.set)
+lines_listbox.bind("<<ListboxSelect>>", on_list_select)
 
 # Plot + toolbar
 plot_frame = ttk.Frame(list_plot); plot_frame.grid(row=0, column=1, sticky="nsew")
